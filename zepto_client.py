@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import webbrowser
 import httpx
@@ -22,6 +23,15 @@ client = OpenAI(
 )
 
 MODEL = "openai/gpt-oss-120b:free"
+MAX_HISTORY = 10  # Max messages kept in context per chat turn (trims oldest first)
+
+# Items to watch for availability. Add or remove names from this list.
+WATCHLIST: list[str] = [
+    "Amul Protien Shake",
+    "Nandini Fresh Paneer",
+    "Nandini Standardized Fresh Milk | Pouch 1L",
+    "Figaro Extra Virgin Olive Oil"
+]
 
 # Cache for widget HTML fetched from MCP resources
 _widget_cache: dict[str, str] = {}
@@ -85,11 +95,14 @@ def render_html(html: str, data: dict | None = None, title: str = "Zepto"):
     )
     tmp.write(html)
     tmp.close()
-    webbrowser.open(f'file://{tmp.name}')
-    print(f"  [🌐 UI opened in browser: {title}]")
+    # webbrowser.open(f'file://{tmp.name}')
+    # print(f"  [🌐 UI opened in browser: {title}]")
 
 
 async def chat(session, tools, tool_meta, user_message, history):
+    # Trim to rolling window before adding new turn
+    if len(history) > MAX_HISTORY:
+        del history[:len(history) - MAX_HISTORY]
     history.append({"role": "user", "content": user_message})
 
     max_retries = 3
@@ -113,8 +126,10 @@ async def chat(session, tools, tool_meta, user_message, history):
                 max_tokens=800,
             )
         except Exception as e:
-            if "tool_use_failed" in str(e) and max_retries > 0:
+            err = str(e)
+            if max_retries > 0 and ("tool_use_failed" in err or "503" in err or "capacity_error" in err or "No backends" in err):
                 max_retries -= 1
+                await asyncio.sleep(2)
                 continue
             raise
 
@@ -129,7 +144,16 @@ async def chat(session, tools, tool_meta, user_message, history):
 
         for tool_call in msg.tool_calls:
             fn_name = tool_call.function.name
-            fn_args = json.loads(tool_call.function.arguments)
+            try:
+                fn_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as je:
+                print(f"  [⚠ {fn_name} bad JSON args, skipping: {je}]")
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"Error: malformed tool arguments — {je}",
+                })
+                continue
 
             # Fix LLM sending JSON strings instead of proper types
             for key, val in fn_args.items():
@@ -256,6 +280,8 @@ h2{{color:#7b2d8e}}</style></head>
 
 
 async def main():
+    auto_mode = "--auto" in sys.argv  # Skip interactive loop when run by Task Scheduler
+
     server_params = StdioServerParameters(
         command="npx",
         args=["mcp-remote", "https://mcp.zepto.co.in/mcp"],
@@ -324,6 +350,51 @@ async def main():
                 history
             )
             print(f"Assistant: {boot_response}\n")
+
+            # Reset history — don't carry verbose boot tool calls into the interactive session
+            history.clear()
+            history.append({"role": "assistant", "content": boot_response})
+
+            # Search watchlist items and add available ones to cart in one shot
+            if WATCHLIST:
+                print("─" * 40)
+                print(f"🔍 Checking watchlist ({len(WATCHLIST)} item(s))...\n")
+
+                # Clear existing cart before adding watchlist items
+                clear_resp = await chat(
+                    session, tools, tool_meta,
+                    "Call view_cart to get current items, then remove all of them by setting each item's quantity to 0. "
+                    "Confirm once the cart is empty.",
+                    [],
+                )
+                print(f"  [Cart cleared] {clear_resp.strip()}\n")
+
+                for item in WATCHLIST:
+                    resp = await chat(
+                        session, tools, tool_meta,
+                        f"Search Zepto for '{item}'. "
+                        f"Only add exactly 1 unit to my cart if the search results contain a product whose name closely matches '{item}'. "
+                        "Do NOT add any substitute, alternative, or similar product. Do NOT add more than 1 unit. "
+                        "If the exact item is not found or out of stock, just say so briefly and do nothing else.",
+                        [],
+                    )
+                    print(f"  [{item}] {resp.strip()}\n")
+
+                # Check cart total and delivery charge via create_order dry-run
+                checkout_history: list = []
+                cart_resp = await chat(
+                    session, tools, tool_meta,
+                    "Call create_order with confirmOrder=False to get an order preview. "
+                    "Report the cart total and delivery charge from the preview. "
+                    "If total > 100 AND total < 250 AND delivery charge is 0, highlight that the order is ready to place. "
+                    "Otherwise explain which condition was not met.",
+                    checkout_history,
+                )
+                print(f"  [Cart] {cart_resp.strip()}\n")
+
+            if auto_mode:
+                print("Auto mode: exiting after watchlist check.")
+                return
 
             print("─" * 40)
             print("Session ready. Type your grocery requests below.")
