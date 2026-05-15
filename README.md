@@ -2,6 +2,10 @@
 
 A Telegram bot that lets household members order groceries from [Zepto](https://www.zepto.co.in/) via text or voice messages. It parses natural language requests, respects household dietary preferences, manages the cart, and handles checkout with online payment or Cash on Delivery.
 
+## Demo
+
+![Grocery Bot Demo](Animation.gif)
+
 ## Features
 
 - **Text & voice input** — send a grocery list as text or a voice note (transcribed via faster-whisper)
